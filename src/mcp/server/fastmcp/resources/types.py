@@ -4,14 +4,13 @@ import inspect
 import json
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Union
 
 import anyio
 import anyio.to_thread
 import httpx
-import pydantic.json
-import pydantic_core
-from pydantic import Field, ValidationInfo
+from pydantic import Field, validator
+from pydantic.json import pydantic_encoder
 
 from mcp.server.fastmcp.resources.base import Resource
 
@@ -51,21 +50,31 @@ class FunctionResource(Resource):
 
     fn: Callable[[], Any] = Field(exclude=True)
 
-    async def read(self) -> str | bytes:
+    async def read(self) -> Union[str, bytes]:
         """Read the resource by calling the wrapped function."""
         try:
             result = (
                 await self.fn() if inspect.iscoroutinefunction(self.fn) else self.fn()
             )
             if isinstance(result, Resource):
-                return await result.read()
+                read_result = await result.read()
+                # Ensure the result of reading the nested resource is str or bytes
+                if isinstance(read_result, (str, bytes)):
+                    return read_result
+                else:
+                    # Fallback: attempt JSON serialization or string conversion
+                    try:
+                        return json.dumps(read_result, default=pydantic_encoder)
+                    except TypeError:
+                        return str(read_result)
             if isinstance(result, bytes):
                 return result
             if isinstance(result, str):
                 return result
+            # For other types, attempt JSON serialization
             try:
-                return json.dumps(pydantic_core.to_jsonable_python(result))
-            except (TypeError, pydantic_core.PydanticSerializationError):
+                return json.dumps(result, default=pydantic_encoder)
+            except TypeError:
                 # If JSON serialization fails, try str()
                 return str(result)
         except Exception as e:
@@ -88,7 +97,7 @@ class FileResource(Resource):
         description="MIME type of the resource content",
     )
 
-    @pydantic.field_validator("path")
+    @validator("path")
     @classmethod
     def validate_absolute_path(cls, path: Path) -> Path:
         """Ensure path is absolute."""
@@ -96,16 +105,23 @@ class FileResource(Resource):
             raise ValueError("Path must be absolute")
         return path
 
-    @pydantic.field_validator("is_binary")
+    @validator("is_binary", always=True) # always=True needed to access other fields via `values`
     @classmethod
-    def set_binary_from_mime_type(cls, is_binary: bool, info: ValidationInfo) -> bool:
+    def set_binary_from_mime_type(cls, is_binary: bool, values: Dict[str, Any]) -> bool:
         """Set is_binary based on mime_type if not explicitly set."""
-        if is_binary:
-            return True
-        mime_type = info.data.get("mime_type", "text/plain")
-        return not mime_type.startswith("text/")
+        # If is_binary is already True (explicitly set or default), keep it.
+        # Or if mime_type isn't available yet in validation context (shouldn't happen with always=True)
+        if is_binary or "mime_type" not in values:
+             return is_binary # Return the provided value
 
-    async def read(self) -> str | bytes:
+        # If is_binary is False (default), derive from mime_type
+        mime_type = values.get("mime_type", "text/plain")
+        # Consider it binary if mime_type is known and doesn't start with "text/"
+        is_likely_binary = isinstance(mime_type, str) and not mime_type.startswith("text/")
+        return is_likely_binary
+
+
+    async def read(self) -> Union[str, bytes]:
         """Read the file content."""
         try:
             if self.is_binary:
@@ -123,12 +139,26 @@ class HttpResource(Resource):
         default="application/json", description="MIME type of the resource content"
     )
 
-    async def read(self) -> str | bytes:
+    async def read(self) -> Union[str, bytes]:
         """Read the HTTP content."""
         async with httpx.AsyncClient() as client:
-            response = await client.get(self.url)
-            response.raise_for_status()
-            return response.text
+            try:
+                response = await client.get(self.url)
+                response.raise_for_status() # Raise HTTPStatusError for bad responses (4xx or 5xx)
+                # Heuristic to decide whether to return text or bytes based on mime_type
+                content_type = response.headers.get("content-type", self.mime_type).lower()
+                if content_type.startswith("text/"):
+                    return response.text
+                elif content_type == "application/json":
+                     # Even if JSON, return as text for consistency unless specifically binary
+                     return response.text
+                else:
+                    # Assume binary for other types
+                    return response.content
+            except httpx.HTTPStatusError as e:
+                 raise ValueError(f"HTTP error fetching {self.url}: {e.response.status_code} {e.response.reason_phrase}") from e
+            except httpx.RequestError as e:
+                 raise ValueError(f"Error requesting {self.url}: {e}") from e
 
 
 class DirectoryResource(Resource):
@@ -138,14 +168,14 @@ class DirectoryResource(Resource):
     recursive: bool = Field(
         default=False, description="Whether to list files recursively"
     )
-    pattern: str | None = Field(
+    pattern: Union[str, None] = Field( # Use Union for Optional in Pydantic v1
         default=None, description="Optional glob pattern to filter files"
     )
     mime_type: str = Field(
         default="application/json", description="MIME type of the resource content"
     )
 
-    @pydantic.field_validator("path")
+    @validator("path")
     @classmethod
     def validate_absolute_path(cls, path: Path) -> Path:
         """Ensure path is absolute."""
@@ -161,25 +191,20 @@ class DirectoryResource(Resource):
             raise NotADirectoryError(f"Not a directory: {self.path}")
 
         try:
-            if self.pattern:
-                return (
-                    list(self.path.glob(self.pattern))
-                    if not self.recursive
-                    else list(self.path.rglob(self.pattern))
-                )
-            return (
-                list(self.path.glob("*"))
-                if not self.recursive
-                else list(self.path.rglob("*"))
-            )
+            glob_method = self.path.rglob if self.recursive else self.path.glob
+            pattern_to_use = self.pattern if self.pattern else "*"
+            return list(glob_method(pattern_to_use))
         except Exception as e:
-            raise ValueError(f"Error listing directory {self.path}: {e}")
+            raise ValueError(f"Error listing directory {self.path} with pattern '{self.pattern}': {e}") from e
 
     async def read(self) -> str:  # Always returns JSON string
         """Read the directory listing."""
         try:
-            files = await anyio.to_thread.run_sync(self.list_files)
-            file_list = [str(f.relative_to(self.path)) for f in files if f.is_file()]
+            # Run the synchronous list_files in a thread
+            all_paths = await anyio.to_thread.run_sync(self.list_files)
+            # Filter for files and make paths relative to the resource's root path
+            file_list = [str(p.relative_to(self.path)) for p in all_paths if p.is_file()]
             return json.dumps({"files": file_list}, indent=2)
         except Exception as e:
-            raise ValueError(f"Error reading directory {self.path}: {e}")
+            # Catch potential errors during listing or JSON dumping
+            raise ValueError(f"Error reading directory listing for {self.path}: {e}") from e

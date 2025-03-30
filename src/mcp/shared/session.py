@@ -3,10 +3,10 @@ from collections.abc import Callable
 from contextlib import AsyncExitStack
 from datetime import timedelta
 from types import TracebackType
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, Union, Optional, Dict
 
 import anyio
-import anyio.lowlevel
+# import anyio.lowlevel # This import is unused, removing it
 import httpx
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from pydantic import BaseModel
@@ -39,7 +39,7 @@ ReceiveNotificationT = TypeVar(
     "ReceiveNotificationT", ClientNotification, ServerNotification
 )
 
-RequestId = str | int
+RequestId = Union[str, int]
 
 
 class RequestResponder(Generic[ReceiveRequestT, SendResultT]):
@@ -61,7 +61,7 @@ class RequestResponder(Generic[ReceiveRequestT, SendResultT]):
     def __init__(
         self,
         request_id: RequestId,
-        request_meta: RequestParams.Meta | None,
+        request_meta: Optional[RequestParams.Meta],
         request: ReceiveRequestT,
         session: """BaseSession[
             SendRequestT,
@@ -90,9 +90,9 @@ class RequestResponder(Generic[ReceiveRequestT, SendResultT]):
 
     def __exit__(
         self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None,
+        exc_type: Optional[type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
     ) -> None:
         """Exit the context manager, performing cleanup and notifying completion."""
         try:
@@ -104,7 +104,7 @@ class RequestResponder(Generic[ReceiveRequestT, SendResultT]):
                 raise RuntimeError("No active cancel scope")
             self._cancel_scope.__exit__(exc_type, exc_val, exc_tb)
 
-    async def respond(self, response: SendResultT | ErrorData) -> None:
+    async def respond(self, response: Union[SendResultT, ErrorData]) -> None:
         """Send a response for this request.
 
         Must be called within a context manager block.
@@ -164,20 +164,20 @@ class BaseSession(
     messages when entered.
     """
 
-    _response_streams: dict[
-        RequestId, MemoryObjectSendStream[JSONRPCResponse | JSONRPCError]
+    _response_streams: Dict[
+        RequestId, MemoryObjectSendStream[Union[JSONRPCResponse, JSONRPCError]]
     ]
     _request_id: int
-    _in_flight: dict[RequestId, RequestResponder[ReceiveRequestT, SendResultT]]
+    _in_flight: Dict[RequestId, RequestResponder[ReceiveRequestT, SendResultT]]
 
     def __init__(
         self,
-        read_stream: MemoryObjectReceiveStream[JSONRPCMessage | Exception],
+        read_stream: MemoryObjectReceiveStream[Union[JSONRPCMessage, Exception]],
         write_stream: MemoryObjectSendStream[JSONRPCMessage],
         receive_request_type: type[ReceiveRequestT],
         receive_notification_type: type[ReceiveNotificationT],
         # If none, reading will never time out
-        read_timeout_seconds: timedelta | None = None,
+        read_timeout_seconds: Optional[timedelta] = None,
     ) -> None:
         self._read_stream = read_stream
         self._write_stream = write_stream
@@ -198,10 +198,10 @@ class BaseSession(
 
     async def __aexit__(
         self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None,
-    ) -> bool | None:
+        exc_type: Optional[type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> Optional[bool]:
         await self._exit_stack.aclose()
         # Using BaseSession as a context manager should not block on exit (this
         # would be very surprising behavior), so make sure to cancel the tasks
@@ -226,7 +226,7 @@ class BaseSession(
         self._request_id = request_id + 1
 
         response_stream, response_stream_reader = anyio.create_memory_object_stream[
-            JSONRPCResponse | JSONRPCError
+            Union[JSONRPCResponse, JSONRPCError]
         ](1)
         self._response_streams[request_id] = response_stream
 
@@ -236,12 +236,12 @@ class BaseSession(
         jsonrpc_request = JSONRPCRequest(
             jsonrpc="2.0",
             id=request_id,
-            **request.model_dump(by_alias=True, mode="json", exclude_none=True),
+            **request.dict(by_alias=True, exclude_none=True), # Use dict() instead of model_dump()
         )
 
         # TODO: Support progress callbacks
 
-        await self._write_stream.send(JSONRPCMessage(jsonrpc_request))
+        await self._write_stream.send(JSONRPCMessage(__root__=jsonrpc_request)) # Pass root model
 
         try:
             with anyio.fail_after(
@@ -265,7 +265,8 @@ class BaseSession(
         if isinstance(response_or_error, JSONRPCError):
             raise McpError(response_or_error.error)
         else:
-            return result_type.model_validate(response_or_error.result)
+            # Use parse_obj() instead of model_validate()
+            return result_type.parse_obj(response_or_error.result)
 
     async def send_notification(self, notification: SendNotificationT) -> None:
         """
@@ -274,26 +275,28 @@ class BaseSession(
         """
         jsonrpc_notification = JSONRPCNotification(
             jsonrpc="2.0",
-            **notification.model_dump(by_alias=True, mode="json", exclude_none=True),
+            # Use dict() instead of model_dump()
+            **notification.dict(by_alias=True, exclude_none=True),
         )
 
-        await self._write_stream.send(JSONRPCMessage(jsonrpc_notification))
+        await self._write_stream.send(JSONRPCMessage(__root__=jsonrpc_notification)) # Pass root model
 
     async def _send_response(
-        self, request_id: RequestId, response: SendResultT | ErrorData
+        self, request_id: RequestId, response: Union[SendResultT, ErrorData]
     ) -> None:
         if isinstance(response, ErrorData):
             jsonrpc_error = JSONRPCError(jsonrpc="2.0", id=request_id, error=response)
-            await self._write_stream.send(JSONRPCMessage(jsonrpc_error))
+            await self._write_stream.send(JSONRPCMessage(__root__=jsonrpc_error)) # Pass root model
         else:
             jsonrpc_response = JSONRPCResponse(
                 jsonrpc="2.0",
                 id=request_id,
-                result=response.model_dump(
-                    by_alias=True, mode="json", exclude_none=True
+                # Use dict() instead of model_dump()
+                result=response.dict(
+                    by_alias=True, exclude_none=True
                 ),
             )
-            await self._write_stream.send(JSONRPCMessage(jsonrpc_response))
+            await self._write_stream.send(JSONRPCMessage(__root__=jsonrpc_response)) # Pass root model
 
     async def _receive_loop(self) -> None:
         async with (
@@ -303,17 +306,21 @@ class BaseSession(
             async for message in self._read_stream:
                 if isinstance(message, Exception):
                     await self._handle_incoming(message)
-                elif isinstance(message.root, JSONRPCRequest):
-                    validated_request = self._receive_request_type.model_validate(
-                        message.root.model_dump(
-                            by_alias=True, mode="json", exclude_none=True
+                # Use __root__ instead of .root
+                elif isinstance(message.__root__, JSONRPCRequest):
+                    # Use parse_obj() instead of model_validate()
+                    # Use __root__ instead of .root
+                    validated_request = self._receive_request_type.parse_obj(
+                        message.__root__.dict(
+                            by_alias=True, exclude_none=True
                         )
                     )
 
                     responder = RequestResponder(
-                        request_id=message.root.id,
-                        request_meta=validated_request.root.params.meta
-                        if validated_request.root.params
+                        request_id=message.__root__.id, # Use __root__
+                        # Use __root__ instead of .root
+                        request_meta=validated_request.__root__.params.meta
+                        if validated_request.__root__.params
                         else None,
                         request=validated_request,
                         session=self,
@@ -326,16 +333,21 @@ class BaseSession(
                     if not responder._completed:  # type: ignore[reportPrivateUsage]
                         await self._handle_incoming(responder)
 
-                elif isinstance(message.root, JSONRPCNotification):
+                # Use __root__ instead of .root
+                elif isinstance(message.__root__, JSONRPCNotification):
                     try:
-                        notification = self._receive_notification_type.model_validate(
-                            message.root.model_dump(
-                                by_alias=True, mode="json", exclude_none=True
+                        # Use parse_obj() instead of model_validate()
+                        # Use __root__ instead of .root
+                        notification = self._receive_notification_type.parse_obj(
+                            message.__root__.dict(
+                                by_alias=True, exclude_none=True
                             )
                         )
                         # Handle cancellation notifications
-                        if isinstance(notification.root, CancelledNotification):
-                            cancelled_id = notification.root.params.requestId
+                        # Use __root__ instead of .root
+                        if isinstance(notification.__root__, CancelledNotification):
+                            # Use __root__ instead of .root
+                            cancelled_id = notification.__root__.params.requestId
                             if cancelled_id in self._in_flight:
                                 await self._in_flight[cancelled_id].cancel()
                         else:
@@ -345,12 +357,14 @@ class BaseSession(
                         # For other validation errors, log and continue
                         logging.warning(
                             f"Failed to validate notification: {e}. "
-                            f"Message was: {message.root}"
+                            f"Message was: {message.__root__}" # Use __root__
                         )
                 else:  # Response or error
-                    stream = self._response_streams.pop(message.root.id, None)
+                    # Use __root__ instead of .root
+                    stream = self._response_streams.pop(message.__root__.id, None)
                     if stream:
-                        await stream.send(message.root)
+                        # Use __root__ instead of .root
+                        await stream.send(message.__root__)
                     else:
                         await self._handle_incoming(
                             RuntimeError(
@@ -377,18 +391,20 @@ class BaseSession(
         """
 
     async def send_progress_notification(
-        self, progress_token: str | int, progress: float, total: float | None = None
+        self, progress_token: Union[str, int], progress: float, total: Optional[float] = None
     ) -> None:
         """
         Sends a progress notification for a request that is currently being
         processed.
         """
+        # Implementation might be needed depending on subclass usage
+        pass
 
     async def _handle_incoming(
         self,
-        req: RequestResponder[ReceiveRequestT, SendResultT]
-        | ReceiveNotificationT
-        | Exception,
+        req: Union[RequestResponder[ReceiveRequestT, SendResultT],
+                   ReceiveNotificationT,
+                   Exception],
     ) -> None:
         """A generic handler for incoming messages. Overwritten by subclasses."""
         pass

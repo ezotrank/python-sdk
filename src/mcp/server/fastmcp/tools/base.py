@@ -2,7 +2,7 @@ from __future__ import annotations as _annotations
 
 import inspect
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from pydantic import BaseModel, Field
 
@@ -27,17 +27,21 @@ class Tool(BaseModel):
         " arguments"
     )
     is_async: bool = Field(description="Whether the tool is async")
-    context_kwarg: str | None = Field(
+    context_kwarg: Optional[str] = Field(
         None, description="Name of the kwarg that should receive context"
     )
+
+    class Config:
+        # Pydantic v1 needs this for Callable type
+        arbitrary_types_allowed = True
 
     @classmethod
     def from_function(
         cls,
         fn: Callable[..., Any],
-        name: str | None = None,
-        description: str | None = None,
-        context_kwarg: str | None = None,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        context_kwarg: Optional[str] = None,
     ) -> Tool:
         """Create a Tool from a function."""
         from mcp.server.fastmcp import Context
@@ -53,6 +57,9 @@ class Tool(BaseModel):
         if context_kwarg is None:
             sig = inspect.signature(fn)
             for param_name, param in sig.parameters.items():
+                # In Pydantic v1, types might not be directly comparable with `is`.
+                # Using `issubclass` or checking the origin might be safer,
+                # but let's assume `is Context` works for now.
                 if param.annotation is Context:
                     context_kwarg = param_name
                     break
@@ -61,7 +68,8 @@ class Tool(BaseModel):
             fn,
             skip_names=[context_kwarg] if context_kwarg is not None else [],
         )
-        parameters = func_arg_metadata.arg_model.model_json_schema()
+        # Pydantic v1 uses .schema() instead of .model_json_schema()
+        parameters = func_arg_metadata.arg_model.schema()
 
         return cls(
             fn=fn,
@@ -76,17 +84,21 @@ class Tool(BaseModel):
     async def run(
         self,
         arguments: dict[str, Any],
-        context: Context[ServerSessionT, LifespanContextT] | None = None,
+        context: Optional[Context[ServerSessionT, LifespanContextT]] = None,
     ) -> Any:
         """Run the tool with arguments."""
         try:
+            # Ensure context is passed correctly if needed
+            context_dict = {}
+            if self.context_kwarg is not None and context is not None:
+                context_dict = {self.context_kwarg: context}
+
             return await self.fn_metadata.call_fn_with_arg_validation(
                 self.fn,
                 self.is_async,
                 arguments,
-                {self.context_kwarg: context}
-                if self.context_kwarg is not None
-                else None,
+                context_dict if context_dict else None, # Pass None if empty
             )
         except Exception as e:
+            # Consider more specific error handling if necessary
             raise ToolError(f"Error executing tool {self.name}: {e}") from e

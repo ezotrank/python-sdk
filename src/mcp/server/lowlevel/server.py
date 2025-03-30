@@ -71,7 +71,7 @@ import logging
 import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, Union
 
 import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
@@ -223,7 +223,7 @@ class Server(Generic[LifespanResultT]):
 
             async def handler(_: Any):
                 prompts = await func()
-                return types.ServerResult(types.ListPromptsResult(prompts=prompts))
+                return types.ServerResult(__root__=types.ListPromptsResult(prompts=prompts))
 
             self.request_handlers[types.ListPromptsRequest] = handler
             return func
@@ -240,7 +240,7 @@ class Server(Generic[LifespanResultT]):
 
             async def handler(req: types.GetPromptRequest):
                 prompt_get = await func(req.params.name, req.params.arguments)
-                return types.ServerResult(prompt_get)
+                return types.ServerResult(__root__=prompt_get)
 
             self.request_handlers[types.GetPromptRequest] = handler
             return func
@@ -254,7 +254,7 @@ class Server(Generic[LifespanResultT]):
             async def handler(_: Any):
                 resources = await func()
                 return types.ServerResult(
-                    types.ListResourcesResult(resources=resources)
+                    __root__=types.ListResourcesResult(resources=resources)
                 )
 
             self.request_handlers[types.ListResourcesRequest] = handler
@@ -269,7 +269,7 @@ class Server(Generic[LifespanResultT]):
             async def handler(_: Any):
                 templates = await func()
                 return types.ServerResult(
-                    types.ListResourceTemplatesResult(resourceTemplates=templates)
+                    __root__=types.ListResourceTemplatesResult(resourceTemplates=templates)
                 )
 
             self.request_handlers[types.ListResourceTemplatesRequest] = handler
@@ -280,7 +280,7 @@ class Server(Generic[LifespanResultT]):
     def read_resource(self):
         def decorator(
             func: Callable[
-                [AnyUrl], Awaitable[str | bytes | Iterable[ReadResourceContents]]
+                [AnyUrl], Awaitable[Union[str, bytes, Iterable[ReadResourceContents]]]
             ],
         ):
             logger.debug("Registering handler for ReadResourceRequest")
@@ -288,52 +288,53 @@ class Server(Generic[LifespanResultT]):
             async def handler(req: types.ReadResourceRequest):
                 result = await func(req.params.uri)
 
-                def create_content(data: str | bytes, mime_type: str | None):
-                    match data:
-                        case str() as data:
-                            return types.TextResourceContents(
-                                uri=req.params.uri,
-                                text=data,
-                                mimeType=mime_type or "text/plain",
-                            )
-                        case bytes() as data:
-                            import base64
-
-                            return types.BlobResourceContents(
-                                uri=req.params.uri,
-                                blob=base64.b64encode(data).decode(),
-                                mimeType=mime_type or "application/octet-stream",
-                            )
-
-                match result:
-                    case str() | bytes() as data:
-                        warnings.warn(
-                            "Returning str or bytes from read_resource is deprecated. "
-                            "Use Iterable[ReadResourceContents] instead.",
-                            DeprecationWarning,
-                            stacklevel=2,
+                def create_content(data: Union[str, bytes], mime_type: str | None):
+                    if isinstance(data, str):
+                        return types.TextResourceContents(
+                            uri=req.params.uri,
+                            text=data,
+                            mimeType=mime_type or "text/plain",
                         )
-                        content = create_content(data, None)
-                    case Iterable() as contents:
-                        contents_list = [
-                            create_content(content_item.content, content_item.mime_type)
-                            for content_item in contents
-                        ]
-                        return types.ServerResult(
-                            types.ReadResourceResult(
-                                contents=contents_list,
-                            )
+                    elif isinstance(data, bytes):
+                        import base64
+                        return types.BlobResourceContents(
+                            uri=req.params.uri,
+                            blob=base64.b64encode(data).decode(),
+                            mimeType=mime_type or "application/octet-stream",
                         )
-                    case _:
-                        raise ValueError(
-                            f"Unexpected return type from read_resource: {type(result)}"
-                        )
+                    else:
+                        # This case should technically not be reachable due to type hints
+                        # but added for robustness.
+                        raise TypeError(f"Unsupported data type: {type(data)}")
 
-                return types.ServerResult(
-                    types.ReadResourceResult(
-                        contents=[content],
+
+                if isinstance(result, (str, bytes)):
+                     warnings.warn(
+                         "Returning str or bytes from read_resource is deprecated. "
+                         "Use Iterable[ReadResourceContents] instead.",
+                         DeprecationWarning,
+                         stacklevel=2,
+                     )
+                     content = create_content(result, None)
+                     return types.ServerResult(
+                         __root__=types.ReadResourceResult(
+                             contents=[content],
+                         )
+                     )
+                elif isinstance(result, Iterable):
+                     contents_list = [
+                         create_content(content_item.content, content_item.mime_type)
+                         for content_item in result # Corrected from `contents` to `result`
+                     ]
+                     return types.ServerResult(
+                         __root__=types.ReadResourceResult(
+                             contents=contents_list,
+                         )
+                     )
+                else:
+                    raise ValueError(
+                        f"Unexpected return type from read_resource: {type(result)}"
                     )
-                )
 
             self.request_handlers[types.ReadResourceRequest] = handler
             return func
@@ -346,7 +347,7 @@ class Server(Generic[LifespanResultT]):
 
             async def handler(req: types.SetLevelRequest):
                 await func(req.params.level)
-                return types.ServerResult(types.EmptyResult())
+                return types.ServerResult(__root__=types.EmptyResult())
 
             self.request_handlers[types.SetLevelRequest] = handler
             return func
@@ -359,7 +360,7 @@ class Server(Generic[LifespanResultT]):
 
             async def handler(req: types.SubscribeRequest):
                 await func(req.params.uri)
-                return types.ServerResult(types.EmptyResult())
+                return types.ServerResult(__root__=types.EmptyResult())
 
             self.request_handlers[types.SubscribeRequest] = handler
             return func
@@ -372,7 +373,7 @@ class Server(Generic[LifespanResultT]):
 
             async def handler(req: types.UnsubscribeRequest):
                 await func(req.params.uri)
-                return types.ServerResult(types.EmptyResult())
+                return types.ServerResult(__root__=types.EmptyResult())
 
             self.request_handlers[types.UnsubscribeRequest] = handler
             return func
@@ -385,7 +386,7 @@ class Server(Generic[LifespanResultT]):
 
             async def handler(_: Any):
                 tools = await func()
-                return types.ServerResult(types.ListToolsResult(tools=tools))
+                return types.ServerResult(__root__=types.ListToolsResult(tools=tools))
 
             self.request_handlers[types.ListToolsRequest] = handler
             return func
@@ -398,7 +399,7 @@ class Server(Generic[LifespanResultT]):
                 ...,
                 Awaitable[
                     Iterable[
-                        types.TextContent | types.ImageContent | types.EmbeddedResource
+                        Union[types.TextContent, types.ImageContent, types.EmbeddedResource]
                     ]
                 ],
             ],
@@ -409,11 +410,11 @@ class Server(Generic[LifespanResultT]):
                 try:
                     results = await func(req.params.name, (req.params.arguments or {}))
                     return types.ServerResult(
-                        types.CallToolResult(content=list(results), isError=False)
+                        __root__=types.CallToolResult(content=list(results), isError=False)
                     )
                 except Exception as e:
                     return types.ServerResult(
-                        types.CallToolResult(
+                        __root__=types.CallToolResult(
                             content=[types.TextContent(type="text", text=str(e))],
                             isError=True,
                         )
@@ -426,7 +427,7 @@ class Server(Generic[LifespanResultT]):
 
     def progress_notification(self):
         def decorator(
-            func: Callable[[str | int, float, float | None], Awaitable[None]],
+            func: Callable[[Union[str, int], float, float | None], Awaitable[None]],
         ):
             logger.debug("Registering handler for ProgressNotification")
 
@@ -446,7 +447,7 @@ class Server(Generic[LifespanResultT]):
         def decorator(
             func: Callable[
                 [
-                    types.PromptReference | types.ResourceReference,
+                    Union[types.PromptReference, types.ResourceReference],
                     types.CompletionArgument,
                 ],
                 Awaitable[types.Completion | None],
@@ -457,7 +458,7 @@ class Server(Generic[LifespanResultT]):
             async def handler(req: types.CompleteRequest):
                 completion = await func(req.params.ref, req.params.argument)
                 return types.ServerResult(
-                    types.CompleteResult(
+                    __root__=types.CompleteResult(
                         completion=completion
                         if completion is not None
                         else types.Completion(values=[], total=None, hasMore=None),
@@ -471,7 +472,7 @@ class Server(Generic[LifespanResultT]):
 
     async def run(
         self,
-        read_stream: MemoryObjectReceiveStream[types.JSONRPCMessage | Exception],
+        read_stream: MemoryObjectReceiveStream[Union[types.JSONRPCMessage, Exception]],
         write_stream: MemoryObjectSendStream[types.JSONRPCMessage],
         initialization_options: InitializationOptions,
         # When False, exceptions are returned as messages to the client.
@@ -487,12 +488,21 @@ class Server(Generic[LifespanResultT]):
             )
 
             async with anyio.create_task_group() as tg:
-                async for message in session.incoming_messages:
-                    logger.debug(f"Received message: {message}")
+                async for message_union in session.incoming_messages:
+                    logger.debug(f"Received message: {message_union}")
+
+                    # Extract the actual message or exception
+                    if isinstance(message_union, Exception):
+                         message_obj = message_union
+                    elif isinstance(message_union, types.JSONRPCMessage):
+                         message_obj = message_union.__root__ # Get underlying obj
+                    else:
+                         # Handle RequestResponder which wraps the request
+                         message_obj = message_union
 
                     tg.start_soon(
                         self._handle_message,
-                        message,
+                        message_obj, # Pass the extracted object or exception
                         session,
                         lifespan_context,
                         raise_exceptions,
@@ -500,41 +510,59 @@ class Server(Generic[LifespanResultT]):
 
     async def _handle_message(
         self,
-        message: RequestResponder[types.ClientRequest, types.ServerResult]
-        | types.ClientNotification
-        | Exception,
+        message: Union[
+             RequestResponder[types.ClientRequest, types.ServerResult],
+             types.JSONRPCNotification, # Use specific notification type
+             Exception
+        ],
         session: ServerSession,
         lifespan_context: LifespanResultT,
         raise_exceptions: bool = False,
     ):
         with warnings.catch_warnings(record=True) as w:
-            # TODO(Marcelo): We should be checking if message is Exception here.
-            match message:  # type: ignore[reportMatchNotExhaustive]
-                case (
-                    RequestResponder(request=types.ClientRequest(root=req)) as responder
-                ):
-                    with responder:
-                        await self._handle_request(
-                            message, req, session, lifespan_context, raise_exceptions
-                        )
-                case types.ClientNotification(root=notify):
-                    await self._handle_notification(notify)
+            if isinstance(message, RequestResponder):
+                 # We know message.request is ClientRequest which has __root__
+                 req = message.request.__root__
+                 with message: # Use the responder context manager
+                      await self._handle_request(
+                           message, req, session, lifespan_context, raise_exceptions
+                      )
+            elif isinstance(message, types.JSONRPCNotification):
+                 # message itself is the notification object from the union
+                 await self._handle_notification(message)
+            elif isinstance(message, Exception):
+                 # Handle exceptions if needed, e.g., log them
+                 logger.error(f"Received exception directly: {message}")
+                 if raise_exceptions:
+                      raise message
+            else:
+                 logger.warning(f"Unhandled message type: {type(message)}")
+
 
             for warning in w:
                 logger.info(f"Warning: {warning.category.__name__}: {warning.message}")
 
     async def _handle_request(
         self,
-        message: RequestResponder[types.ClientRequest, types.ServerResult],
-        req: Any,
+        # Keep original responder for responding
+        responder: RequestResponder[types.ClientRequest, types.ServerResult],
+        # Pass the actual request object (extracted from __root__)
+        req: Union[
+                types.PingRequest, types.InitializeRequest, types.CompleteRequest,
+                types.SetLevelRequest, types.GetPromptRequest, types.ListPromptsRequest,
+                types.ListResourcesRequest, types.ListResourceTemplatesRequest,
+                types.ReadResourceRequest, types.SubscribeRequest, types.UnsubscribeRequest,
+                types.CallToolRequest, types.ListToolsRequest
+            ],
         session: ServerSession,
         lifespan_context: LifespanResultT,
         raise_exceptions: bool,
     ):
         logger.info(f"Processing request of type {type(req).__name__}")
-        if type(req) in self.request_handlers:
-            handler = self.request_handlers[type(req)]
-            logger.debug(f"Dispatching request of type {type(req).__name__}")
+        req_type = type(req)
+        if req_type in self.request_handlers:
+            handler = self.request_handlers[req_type]
+            logger.debug(f"Dispatching request of type {req_type.__name__}")
 
             token = None
             try:
@@ -542,49 +570,63 @@ class Server(Generic[LifespanResultT]):
                 # app.get_request_context()
                 token = request_ctx.set(
                     RequestContext(
-                        message.request_id,
-                        message.request_meta,
+                        responder.request_id,
+                        responder.request_meta,
                         session,
                         lifespan_context,
                     )
                 )
-                response = await handler(req)
+                response_result = await handler(req) # handler returns ServerResult
+                response_data = response_result.__root__ # Extract data from __root__
+
             except McpError as err:
-                response = err.error
+                # McpError already contains the ErrorData payload
+                response_data = err.error
             except Exception as err:
+                logger.exception("Error handling request") # Log with traceback
                 if raise_exceptions:
                     raise err
-                response = types.ErrorData(code=0, message=str(err), data=None)
+                # Create ErrorData payload
+                response_data = types.ErrorData(code=types.INTERNAL_ERROR, message=str(err), data=None)
             finally:
                 # Reset the global state after we are done
                 if token is not None:
                     request_ctx.reset(token)
 
-            await message.respond(response)
+            # Respond using the original responder
+            await responder.respond(response_data)
         else:
-            await message.respond(
+            # Respond using the original responder
+            await responder.respond(
                 types.ErrorData(
                     code=types.METHOD_NOT_FOUND,
-                    message="Method not found",
+                    message=f"Method not found: {getattr(req, 'method', type(req).__name__)}",
                 )
             )
 
-        logger.debug("Response sent")
+        logger.debug(f"Response sent for request ID {responder.request_id}")
 
-    async def _handle_notification(self, notify: Any):
-        if type(notify) in self.notification_handlers:
-            assert type(notify) in self.notification_handlers
+    async def _handle_notification(self, notify: types.JSONRPCNotification):
+        # Extract the actual notification object from the __root__ of ClientNotification if needed
+        # In this version, _handle_message passes the JSONRPCNotification directly
+        actual_notify_obj = notify # Already the correct type
+        notify_type = type(actual_notify_obj)
 
-            handler = self.notification_handlers[type(notify)]
+        if notify_type in self.notification_handlers:
+            handler = self.notification_handlers[notify_type]
             logger.debug(
-                f"Dispatching notification of type " f"{type(notify).__name__}"
+                f"Dispatching notification of type {notify_type.__name__}"
             )
 
             try:
-                await handler(notify)
+                # Pass the actual notification object to the handler
+                await handler(actual_notify_obj)
             except Exception as err:
-                logger.error(f"Uncaught exception in notification handler: " f"{err}")
+                logger.error(f"Uncaught exception in notification handler: {err}", exc_info=True)
+        else:
+            logger.warning(f"No handler registered for notification type {notify_type.__name__}")
 
 
 async def _ping_handler(request: types.PingRequest) -> types.ServerResult:
-    return types.ServerResult(types.EmptyResult())
+    # For Pydantic v1 RootModel, wrap the result
+    return types.ServerResult(__root__=types.EmptyResult())

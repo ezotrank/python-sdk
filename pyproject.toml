@@ -25,10 +25,10 @@ dependencies = [
     "anyio>=4.5",
     "httpx>=0.27",
     "httpx-sse>=0.4",
-    "pydantic>=2.7.2,<3.0.0",
+    "pydantic==1.10.17",
     "starlette>=0.27",
     "sse-starlette>=1.6.1",
-    "pydantic-settings>=2.5.2",
+    # "pydantic-settings>=2.5.2", # Removed for Pydantic v1 compatibility
     "uvicorn>=0.23.1",
 ]
 
@@ -113,5 +113,5 @@ filterwarnings = [
     # This should be fixed on Uvicorn's side.
     "ignore::DeprecationWarning:websockets",
     "ignore:websockets.server.WebSocketServerProtocol is deprecated:DeprecationWarning",
-    "ignore:Returning str or bytes.*:DeprecationWarning:mcp.server.lowlevel"
+    "ignore:Returning str or bytes.*:DeprecationWarning:mcp.server.lowlevel",
 ]

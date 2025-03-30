@@ -1,9 +1,9 @@
 from datetime import timedelta
-from typing import Any, Protocol
+from typing import Any, Optional, Protocol, Union
 
 import anyio.lowlevel
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
-from pydantic import AnyUrl, TypeAdapter
+from pydantic import AnyUrl, parse_obj_as
 
 import mcp.types as types
 from mcp.shared.context import RequestContext
@@ -16,13 +16,13 @@ class SamplingFnT(Protocol):
         self,
         context: RequestContext["ClientSession", Any],
         params: types.CreateMessageRequestParams,
-    ) -> types.CreateMessageResult | types.ErrorData: ...
+    ) -> Union[types.CreateMessageResult, types.ErrorData]: ...
 
 
 class ListRootsFnT(Protocol):
     async def __call__(
         self, context: RequestContext["ClientSession", Any]
-    ) -> types.ListRootsResult | types.ErrorData: ...
+    ) -> Union[types.ListRootsResult, types.ErrorData]: ...
 
 
 class LoggingFnT(Protocol):
@@ -35,16 +35,20 @@ class LoggingFnT(Protocol):
 class MessageHandlerFnT(Protocol):
     async def __call__(
         self,
-        message: RequestResponder[types.ServerRequest, types.ClientResult]
-        | types.ServerNotification
-        | Exception,
+        message: Union[
+            RequestResponder[types.ServerRequest, types.ClientResult],
+            types.ServerNotification,
+            Exception,
+        ],
     ) -> None: ...
 
 
 async def _default_message_handler(
-    message: RequestResponder[types.ServerRequest, types.ClientResult]
-    | types.ServerNotification
-    | Exception,
+    message: Union[
+        RequestResponder[types.ServerRequest, types.ClientResult],
+        types.ServerNotification,
+        Exception,
+    ],
 ) -> None:
     await anyio.lowlevel.checkpoint()
 
@@ -52,7 +56,7 @@ async def _default_message_handler(
 async def _default_sampling_callback(
     context: RequestContext["ClientSession", Any],
     params: types.CreateMessageRequestParams,
-) -> types.CreateMessageResult | types.ErrorData:
+) -> Union[types.CreateMessageResult, types.ErrorData]:
     return types.ErrorData(
         code=types.INVALID_REQUEST,
         message="Sampling not supported",
@@ -61,7 +65,7 @@ async def _default_sampling_callback(
 
 async def _default_list_roots_callback(
     context: RequestContext["ClientSession", Any],
-) -> types.ListRootsResult | types.ErrorData:
+) -> Union[types.ListRootsResult, types.ErrorData]:
     return types.ErrorData(
         code=types.INVALID_REQUEST,
         message="List roots not supported",
@@ -74,9 +78,8 @@ async def _default_logging_callback(
     pass
 
 
-ClientResponse: TypeAdapter[types.ClientResult | types.ErrorData] = TypeAdapter(
-    types.ClientResult | types.ErrorData
-)
+# Type definition for the response expected by the client-side responder
+ClientResponseType = Union[types.ClientResult, types.ErrorData]
 
 
 class ClientSession(
@@ -90,13 +93,13 @@ class ClientSession(
 ):
     def __init__(
         self,
-        read_stream: MemoryObjectReceiveStream[types.JSONRPCMessage | Exception],
+        read_stream: MemoryObjectReceiveStream[Union[types.JSONRPCMessage, Exception]],
         write_stream: MemoryObjectSendStream[types.JSONRPCMessage],
-        read_timeout_seconds: timedelta | None = None,
-        sampling_callback: SamplingFnT | None = None,
-        list_roots_callback: ListRootsFnT | None = None,
-        logging_callback: LoggingFnT | None = None,
-        message_handler: MessageHandlerFnT | None = None,
+        read_timeout_seconds: Optional[timedelta] = None,
+        sampling_callback: Optional[SamplingFnT] = None,
+        list_roots_callback: Optional[ListRootsFnT] = None,
+        logging_callback: Optional[LoggingFnT] = None,
+        message_handler: Optional[MessageHandlerFnT] = None,
     ) -> None:
         super().__init__(
             read_stream,
@@ -121,7 +124,7 @@ class ClientSession(
 
         result = await self.send_request(
             types.ClientRequest(
-                types.InitializeRequest(
+                __root__=types.InitializeRequest(
                     method="initialize",
                     params=types.InitializeRequestParams(
                         protocolVersion=types.LATEST_PROTOCOL_VERSION,
@@ -145,7 +148,7 @@ class ClientSession(
 
         await self.send_notification(
             types.ClientNotification(
-                types.InitializedNotification(method="notifications/initialized")
+                __root__=types.InitializedNotification(method="notifications/initialized")
             )
         )
 
@@ -155,7 +158,7 @@ class ClientSession(
         """Send a ping request."""
         return await self.send_request(
             types.ClientRequest(
-                types.PingRequest(
+                __root__=types.PingRequest(
                     method="ping",
                 )
             ),
@@ -163,12 +166,12 @@ class ClientSession(
         )
 
     async def send_progress_notification(
-        self, progress_token: str | int, progress: float, total: float | None = None
+        self, progress_token: Union[str, int], progress: float, total: Optional[float] = None
     ) -> None:
         """Send a progress notification."""
         await self.send_notification(
             types.ClientNotification(
-                types.ProgressNotification(
+                __root__=types.ProgressNotification(
                     method="notifications/progress",
                     params=types.ProgressNotificationParams(
                         progressToken=progress_token,
@@ -183,7 +186,7 @@ class ClientSession(
         """Send a logging/setLevel request."""
         return await self.send_request(
             types.ClientRequest(
-                types.SetLevelRequest(
+                __root__=types.SetLevelRequest(
                     method="logging/setLevel",
                     params=types.SetLevelRequestParams(level=level),
                 )
@@ -195,7 +198,7 @@ class ClientSession(
         """Send a resources/list request."""
         return await self.send_request(
             types.ClientRequest(
-                types.ListResourcesRequest(
+                __root__=types.ListResourcesRequest(
                     method="resources/list",
                 )
             ),
@@ -206,7 +209,7 @@ class ClientSession(
         """Send a resources/templates/list request."""
         return await self.send_request(
             types.ClientRequest(
-                types.ListResourceTemplatesRequest(
+                __root__=types.ListResourceTemplatesRequest(
                     method="resources/templates/list",
                 )
             ),
@@ -217,7 +220,7 @@ class ClientSession(
         """Send a resources/read request."""
         return await self.send_request(
             types.ClientRequest(
-                types.ReadResourceRequest(
+                __root__=types.ReadResourceRequest(
                     method="resources/read",
                     params=types.ReadResourceRequestParams(uri=uri),
                 )
@@ -229,7 +232,7 @@ class ClientSession(
         """Send a resources/subscribe request."""
         return await self.send_request(
             types.ClientRequest(
-                types.SubscribeRequest(
+                __root__=types.SubscribeRequest(
                     method="resources/subscribe",
                     params=types.SubscribeRequestParams(uri=uri),
                 )
@@ -241,7 +244,7 @@ class ClientSession(
         """Send a resources/unsubscribe request."""
         return await self.send_request(
             types.ClientRequest(
-                types.UnsubscribeRequest(
+                __root__=types.UnsubscribeRequest(
                     method="resources/unsubscribe",
                     params=types.UnsubscribeRequestParams(uri=uri),
                 )
@@ -250,12 +253,12 @@ class ClientSession(
         )
 
     async def call_tool(
-        self, name: str, arguments: dict[str, Any] | None = None
+        self, name: str, arguments: Optional[dict[str, Any]] = None
     ) -> types.CallToolResult:
         """Send a tools/call request."""
         return await self.send_request(
             types.ClientRequest(
-                types.CallToolRequest(
+                __root__=types.CallToolRequest(
                     method="tools/call",
                     params=types.CallToolRequestParams(name=name, arguments=arguments),
                 )
@@ -267,7 +270,7 @@ class ClientSession(
         """Send a prompts/list request."""
         return await self.send_request(
             types.ClientRequest(
-                types.ListPromptsRequest(
+                __root__=types.ListPromptsRequest(
                     method="prompts/list",
                 )
             ),
@@ -275,12 +278,12 @@ class ClientSession(
         )
 
     async def get_prompt(
-        self, name: str, arguments: dict[str, str] | None = None
+        self, name: str, arguments: Optional[dict[str, str]] = None
     ) -> types.GetPromptResult:
         """Send a prompts/get request."""
         return await self.send_request(
             types.ClientRequest(
-                types.GetPromptRequest(
+                __root__=types.GetPromptRequest(
                     method="prompts/get",
                     params=types.GetPromptRequestParams(name=name, arguments=arguments),
                 )
@@ -290,13 +293,13 @@ class ClientSession(
 
     async def complete(
         self,
-        ref: types.ResourceReference | types.PromptReference,
+        ref: Union[types.ResourceReference, types.PromptReference],
         argument: dict[str, str],
     ) -> types.CompleteResult:
         """Send a completion/complete request."""
         return await self.send_request(
             types.ClientRequest(
-                types.CompleteRequest(
+                __root__=types.CompleteRequest(
                     method="completion/complete",
                     params=types.CompleteRequestParams(
                         ref=ref,
@@ -311,7 +314,7 @@ class ClientSession(
         """Send a tools/list request."""
         return await self.send_request(
             types.ClientRequest(
-                types.ListToolsRequest(
+                __root__=types.ListToolsRequest(
                     method="tools/list",
                 )
             ),
@@ -322,7 +325,7 @@ class ClientSession(
         """Send a roots/list_changed notification."""
         await self.send_notification(
             types.ClientNotification(
-                types.RootsListChangedNotification(
+                __root__=types.RootsListChangedNotification(
                     method="notifications/roots/list_changed",
                 )
             )
@@ -338,30 +341,39 @@ class ClientSession(
             lifespan_context=None,
         )
 
-        match responder.request.root:
-            case types.CreateMessageRequest(params=params):
-                with responder:
-                    response = await self._sampling_callback(ctx, params)
-                    client_response = ClientResponse.validate_python(response)
-                    await responder.respond(client_response)
-
-            case types.ListRootsRequest():
-                with responder:
-                    response = await self._list_roots_callback(ctx)
-                    client_response = ClientResponse.validate_python(response)
-                    await responder.respond(client_response)
-
-            case types.PingRequest():
-                with responder:
-                    return await responder.respond(
-                        types.ClientResult(root=types.EmptyResult())
-                    )
+        request_content = responder.request.__root__
+        if isinstance(request_content, types.CreateMessageRequest):
+            with responder:
+                response = await self._sampling_callback(ctx, request_content.params)
+                client_response = parse_obj_as(ClientResponseType, response)
+                await responder.respond(client_response)
+        elif isinstance(request_content, types.ListRootsRequest):
+            with responder:
+                response = await self._list_roots_callback(ctx)
+                client_response = parse_obj_as(ClientResponseType, response)
+                await responder.respond(client_response)
+        elif isinstance(request_content, types.PingRequest):
+             with responder:
+                 await responder.respond(
+                     types.ClientResult(__root__=types.EmptyResult())
+                 )
+        else:
+            # Handle unknown request types if necessary, or raise an error
+             with responder:
+                await responder.respond_with_error(
+                    types.ErrorData(
+                        code=types.METHOD_NOT_FOUND,
+                        message=f"Method not found: {getattr(request_content, 'method', 'unknown')}"
+                     )
+                 )
 
     async def _handle_incoming(
         self,
-        req: RequestResponder[types.ServerRequest, types.ClientResult]
-        | types.ServerNotification
-        | Exception,
+        req: Union[
+            RequestResponder[types.ServerRequest, types.ClientResult],
+            types.ServerNotification,
+            Exception,
+        ],
     ) -> None:
         """Handle incoming messages by forwarding to the message handler."""
         await self._message_handler(req)
@@ -371,8 +383,9 @@ class ClientSession(
     ) -> None:
         """Handle notifications from the server."""
         # Process specific notification types
-        match notification.root:
-            case types.LoggingMessageNotification(params=params):
-                await self._logging_callback(params)
-            case _:
-                pass
+        notification_content = notification.__root__
+        if isinstance(notification_content, types.LoggingMessageNotification):
+            await self._logging_callback(notification_content.params)
+        else:
+            # Potentially log or handle other notification types
+            pass

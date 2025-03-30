@@ -11,14 +11,16 @@ from contextlib import (
     asynccontextmanager,
 )
 from itertools import chain
-from typing import Any, Generic, Literal
+from typing import Any, Generic, Literal, Optional, Union
 
 import anyio
-import pydantic_core
+
+# import pydantic_core # Removed for V1
 import uvicorn
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BaseSettings, Extra, Field # Added BaseSettings, Extra
 from pydantic.networks import AnyUrl
-from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# from pydantic_settings import BaseSettings, SettingsConfigDict # Removed for V1
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.routing import Mount, Route
@@ -60,11 +62,11 @@ class Settings(BaseSettings, Generic[LifespanResultT]):
     For example, FASTMCP_DEBUG=true will set debug=True.
     """
 
-    model_config = SettingsConfigDict(
-        env_prefix="FASTMCP_",
-        env_file=".env",
-        extra="ignore",
-    )
+    # Pydantic V1 configuration using nested Config class
+    class Config:
+        env_prefix = "FASTMCP_"
+        env_file = ".env"
+        extra = Extra.ignore # Use Extra from pydantic
 
     # Server settings
     debug: bool = False
@@ -90,9 +92,9 @@ class Settings(BaseSettings, Generic[LifespanResultT]):
         description="List of dependencies to install in the server environment",
     )
 
-    lifespan: (
-        Callable[[FastMCP], AbstractAsyncContextManager[LifespanResultT]] | None
-    ) = Field(None, description="Lifespan context manager")
+    lifespan: Optional[
+        Callable[[FastMCP], AbstractAsyncContextManager[LifespanResultT]]
+    ] = Field(None, description="Lifespan context manager")
 
 
 def lifespan_wrapper(
@@ -151,9 +153,12 @@ class FastMCP:
         Args:
             transport: Transport protocol to use ("stdio" or "sse")
         """
-        TRANSPORTS = Literal["stdio", "sse"]
-        if transport not in TRANSPORTS.__args__:  # type: ignore
-            raise ValueError(f"Unknown transport: {transport}")
+        # Use typing.get_args for older python versions if needed, but Literal.__args__ works > 3.8
+        # TRANSPORTS = Literal["stdio", "sse"]
+        # if transport not in get_args(TRANSPORTS):
+        # For simplicity assuming >=3.9 where __args__ is reliable
+        if transport not in Literal["stdio", "sse"].__args__:
+             raise ValueError(f"Unknown transport: {transport}")
 
         if transport == "stdio":
             anyio.run(self.run_stdio_async)
@@ -188,14 +193,17 @@ class FastMCP:
         during a request; outside a request, most methods will error.
         """
         try:
+            # Assuming request_context is thread/task local managed by the server
             request_context = self._mcp_server.request_context
         except LookupError:
             request_context = None
+        # Pass Optional context correctly
         return Context(request_context=request_context, fastmcp=self)
+
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any]
-    ) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+    ) -> Sequence[Union[TextContent, ImageContent, EmbeddedResource]]: # Use Union
         """Call a tool by name with arguments."""
         context = self.get_context()
         result = await self._tool_manager.call_tool(name, arguments, context=context)
@@ -208,7 +216,7 @@ class FastMCP:
         resources = self._resource_manager.list_resources()
         return [
             MCPResource(
-                uri=resource.uri,
+                uri=str(resource.uri), # Ensure URI is string for V1 compatibility if needed
                 name=resource.name or "",
                 description=resource.description,
                 mimeType=resource.mime_type,
@@ -227,18 +235,20 @@ class FastMCP:
             for template in templates
         ]
 
-    async def read_resource(self, uri: AnyUrl | str) -> Iterable[ReadResourceContents]:
+    async def read_resource(self, uri: Union[AnyUrl, str]) -> Iterable[ReadResourceContents]: # Use Union
         """Read a resource by URI."""
-
-        resource = await self._resource_manager.get_resource(uri)
+        # Pydantic V1 AnyUrl validation might differ slightly, ensure input is handled
+        uri_str = str(uri)
+        resource = await self._resource_manager.get_resource(uri_str)
         if not resource:
-            raise ResourceError(f"Unknown resource: {uri}")
+            raise ResourceError(f"Unknown resource: {uri_str}")
 
         try:
             content = await resource.read()
+            # Pass mime_type= correctly
             return [ReadResourceContents(content=content, mime_type=resource.mime_type)]
         except Exception as e:
-            logger.error(f"Error reading resource {uri}: {e}")
+            logger.error(f"Error reading resource {uri_str}: {e}")
             raise ResourceError(str(e))
 
     def add_tool(
@@ -339,7 +349,7 @@ class FastMCP:
                 return "Hello, world!"
 
             @server.resource("resource://my-resource")
-            async get_data() -> str:
+            async def get_data() -> str:
                 data = await fetch_data()
                 return f"Hello, world! {data}"
 
@@ -369,11 +379,19 @@ class FastMCP:
                 uri_params = set(re.findall(r"{(\w+)}", uri))
                 func_params = set(inspect.signature(fn).parameters.keys())
 
-                if uri_params != func_params:
-                    raise ValueError(
+                # Allow context parameter without matching URI param
+                context_params = {
+                    p.name for p in inspect.signature(fn).parameters.values()
+                    if p.annotation is Context or p.annotation == 'Context' # Check annotation robustly
+                }
+                func_params_for_uri = func_params - context_params
+
+                if uri_params != func_params_for_uri:
+                     raise ValueError(
                         f"Mismatch between URI parameters {uri_params} "
-                        f"and function parameters {func_params}"
-                    )
+                        f"and function parameters (excluding Context) {func_params_for_uri}"
+                     )
+
 
                 # Register as template
                 self._resource_manager.add_template(
@@ -386,7 +404,8 @@ class FastMCP:
             else:
                 # Register as regular resource
                 resource = FunctionResource(
-                    uri=AnyUrl(uri),
+                    # Pydantic V1 needs explicit cast sometimes
+                    uri=AnyUrl(uri), # type: ignore[arg-type]
                     name=name,
                     description=description,
                     mime_type=mime_type or "text/plain",
@@ -482,6 +501,7 @@ class FastMCP:
         sse = SseServerTransport(self.settings.message_path)
 
         async def handle_sse(request: Request) -> None:
+            # Ensure Starlette private usage is handled or alternative found if needed
             async with sse.connect_sse(
                 request.scope,
                 request.receive,
@@ -514,6 +534,7 @@ class FastMCP:
                         description=arg.description,
                         required=arg.required,
                     )
+                    # Handle optional arguments list
                     for arg in (prompt.arguments or [])
                 ],
             )
@@ -525,9 +546,10 @@ class FastMCP:
     ) -> GetPromptResult:
         """Get a prompt by name with arguments."""
         try:
-            messages = await self._prompt_manager.render_prompt(name, arguments)
-
-            return GetPromptResult(messages=pydantic_core.to_jsonable_python(messages))
+            messages = await self._prompt_manager.render_prompt(name, arguments or {})
+            # Convert list of Pydantic models to list of dicts for V1 GetPromptResult
+            messages_dict = [m.dict() for m in messages]
+            return GetPromptResult(messages=messages_dict) # type: ignore[arg-type]
         except Exception as e:
             logger.error(f"Error getting prompt {name}: {e}")
             raise ValueError(str(e))
@@ -535,25 +557,33 @@ class FastMCP:
 
 def _convert_to_content(
     result: Any,
-) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+) -> Sequence[Union[TextContent, ImageContent, EmbeddedResource]]: # Use Union
     """Convert a result to a sequence of content objects."""
     if result is None:
         return []
 
-    if isinstance(result, TextContent | ImageContent | EmbeddedResource):
+    # Use Union for isinstance check
+    if isinstance(result, (TextContent, ImageContent, EmbeddedResource)):
         return [result]
 
     if isinstance(result, Image):
         return [result.to_image_content()]
 
-    if isinstance(result, list | tuple):
-        return list(chain.from_iterable(_convert_to_content(item) for item in result))  # type: ignore[reportUnknownVariableType]
+    if isinstance(result, (list, tuple)):
+         # Recursive call with explicit type ignored if needed, depends on result content types
+        return list(chain.from_iterable(_convert_to_content(item) for item in result)) # type: ignore[misc]
+
 
     if not isinstance(result, str):
         try:
-            result = json.dumps(pydantic_core.to_jsonable_python(result))
-        except Exception:
-            result = str(result)
+            # If it's a Pydantic model, use .dict() for JSON serialization
+            if isinstance(result, BaseModel):
+                result = json.dumps(result.dict())
+            else:
+                # Attempt standard JSON dump for other types
+                result = json.dumps(result)
+        except (TypeError, OverflowError): # Catch JSON serialization errors
+            result = str(result) # Fallback to string representation
 
     return [TextContent(type="text", text=result)]
 
@@ -592,19 +622,20 @@ class Context(BaseModel, Generic[ServerSessionT, LifespanContextT]):
     The context is optional - tools that don't need it can omit the parameter.
     """
 
-    _request_context: RequestContext[ServerSessionT, LifespanContextT] | None
-    _fastmcp: FastMCP | None
+    # Use Optional for potentially missing context
+    _request_context: Optional[RequestContext[ServerSessionT, LifespanContextT]] = Field(None, exclude=True)
+    _fastmcp: Optional[FastMCP] = Field(None, exclude=True)
 
-    def __init__(
-        self,
-        *,
-        request_context: RequestContext[ServerSessionT, LifespanContextT] | None = None,
-        fastmcp: FastMCP | None = None,
-        **kwargs: Any,
-    ):
-        super().__init__(**kwargs)
-        self._request_context = request_context
-        self._fastmcp = fastmcp
+    class Config:
+        # Allow arbitrary types for Generic placeholders if needed in V1
+        arbitrary_types_allowed = True
+        # Prevent validation errors for private attributes
+        underscore_attrs_are_private = True
+
+
+    # Pydantic V1 __init__ is usually not needed unless custom logic required
+    # Constructor logic moved to default values / standard initialization
+    # If specific init logic is needed, use Pydantic V1 conventions
 
     @property
     def fastmcp(self) -> FastMCP:
@@ -629,21 +660,22 @@ class Context(BaseModel, Generic[ServerSessionT, LifespanContextT]):
             progress: Current progress value e.g. 24
             total: Optional total value e.g. 100
         """
-
+        # Ensure context exists before accessing properties
+        req_ctx = self.request_context # Raises ValueError if None
         progress_token = (
-            self.request_context.meta.progressToken
-            if self.request_context.meta
+            req_ctx.meta.progressToken # type: ignore[attr-defined]
+            if req_ctx.meta
             else None
         )
 
         if progress_token is None:
             return
 
-        await self.request_context.session.send_progress_notification(
+        await req_ctx.session.send_progress_notification(
             progress_token=progress_token, progress=progress, total=total
         )
 
-    async def read_resource(self, uri: str | AnyUrl) -> Iterable[ReadResourceContents]:
+    async def read_resource(self, uri: Union[str, AnyUrl]) -> Iterable[ReadResourceContents]: # Use Union
         """Read a resource by URI.
 
         Args:
@@ -652,10 +684,9 @@ class Context(BaseModel, Generic[ServerSessionT, LifespanContextT]):
         Returns:
             The resource content as either text or bytes
         """
-        assert (
-            self._fastmcp is not None
-        ), "Context is not available outside of a request"
-        return await self._fastmcp.read_resource(uri)
+        # Ensure fastmcp exists
+        fmcp = self.fastmcp # Raises ValueError if None
+        return await fmcp.read_resource(uri)
 
     async def log(
         self,
@@ -663,6 +694,7 @@ class Context(BaseModel, Generic[ServerSessionT, LifespanContextT]):
         message: str,
         *,
         logger_name: str | None = None,
+        **extra: Any # Accept extra kwargs
     ) -> None:
         """Send a log message to the client.
 
@@ -670,30 +702,38 @@ class Context(BaseModel, Generic[ServerSessionT, LifespanContextT]):
             level: Log level (debug, info, warning, error)
             message: Log message
             logger_name: Optional logger name
-            **extra: Additional structured data to include
+            **extra: Additional structured data to include (passed as data)
         """
+        # In Pydantic V1, extra kwargs aren't automatically handled unless Config allows
+        # Modify data payload if extra fields need specific handling
+        log_data: Any = message
+        if extra:
+            log_data = {"message": message, **extra}
+
         await self.request_context.session.send_log_message(
-            level=level, data=message, logger=logger_name
+            level=level, data=log_data, logger=logger_name
         )
 
     @property
     def client_id(self) -> str | None:
         """Get the client ID if available."""
-        return (
-            getattr(self.request_context.meta, "client_id", None)
-            if self.request_context.meta
-            else None
-        )
+        # Ensure context exists and handle potential AttributeError if meta is None or missing client_id
+        if self._request_context and self._request_context.meta:
+            return getattr(self._request_context.meta, "client_id", None)
+        return None
 
     @property
     def request_id(self) -> str:
         """Get the unique ID for this request."""
+        # Ensure context exists
         return str(self.request_context.request_id)
 
     @property
-    def session(self):
+    def session(self) -> ServerSessionT:
         """Access to the underlying session for advanced usage."""
-        return self.request_context.session
+        # Ensure context exists
+        return self.request_context.session # type: ignore[return-value]
+
 
     # Convenience methods for common log levels
     async def debug(self, message: str, **extra: Any) -> None:

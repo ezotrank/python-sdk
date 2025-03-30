@@ -3,14 +3,27 @@
 import inspect
 import json
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Any, Literal
+from typing import Any, Dict, List, Literal, Optional, Union
 
-import pydantic_core
-from pydantic import BaseModel, Field, TypeAdapter, validate_call
+from pydantic import (
+    BaseModel,
+    Field,
+    parse_obj_as,
+    validate_arguments,
+)
+from pydantic.json import pydantic_encoder
+from pydantic.schema import model_schema
 
-from mcp.types import EmbeddedResource, ImageContent, TextContent
+from mcp.types import (
+    EmbeddedResource,
+    ImageContent,
+    TextContent,
+    UserMessage as MCPUserMessage,
+    AssistantMessage as MCPAssistantMessage,
+)
 
-CONTENT_TYPES = TextContent | ImageContent | EmbeddedResource
+# Define CONTENT_TYPES using Union for Pydantic v1 compatibility
+CONTENT_TYPES = Union[TextContent, ImageContent, EmbeddedResource]
 
 
 class Message(BaseModel):
@@ -19,7 +32,11 @@ class Message(BaseModel):
     role: Literal["user", "assistant"]
     content: CONTENT_TYPES
 
-    def __init__(self, content: str | CONTENT_TYPES, **kwargs: Any):
+    # Pydantic v1 needs Config for arbitrary types
+    class Config:
+        arbitrary_types_allowed = True
+
+    def __init__(self, content: Union[str, CONTENT_TYPES], **kwargs: Any):
         if isinstance(content, str):
             content = TextContent(type="text", text=content)
         super().__init__(content=content, **kwargs)
@@ -28,36 +45,41 @@ class Message(BaseModel):
 class UserMessage(Message):
     """A message from the user."""
 
-    role: Literal["user", "assistant"] = "user"
+    role: Literal["user"] = "user" # Keep literal specific to the class
 
-    def __init__(self, content: str | CONTENT_TYPES, **kwargs: Any):
+    def __init__(self, content: Union[str, CONTENT_TYPES], **kwargs: Any):
+        # Ensure role is explicitly set if passed via kwargs, otherwise default
+        kwargs.setdefault("role", "user")
+        if kwargs["role"] != "user":
+            raise ValueError("UserMessage role must be 'user'")
         super().__init__(content=content, **kwargs)
 
 
 class AssistantMessage(Message):
     """A message from the assistant."""
 
-    role: Literal["user", "assistant"] = "assistant"
+    role: Literal["assistant"] = "assistant" # Keep literal specific to the class
 
-    def __init__(self, content: str | CONTENT_TYPES, **kwargs: Any):
+    def __init__(self, content: Union[str, CONTENT_TYPES], **kwargs: Any):
+         # Ensure role is explicitly set if passed via kwargs, otherwise default
+        kwargs.setdefault("role", "assistant")
+        if kwargs["role"] != "assistant":
+             raise ValueError("AssistantMessage role must be 'assistant'")
         super().__init__(content=content, **kwargs)
 
 
-message_validator = TypeAdapter[UserMessage | AssistantMessage](
-    UserMessage | AssistantMessage
-)
-
-SyncPromptResult = (
-    str | Message | dict[str, Any] | Sequence[str | Message | dict[str, Any]]
-)
-PromptResult = SyncPromptResult | Awaitable[SyncPromptResult]
+# Define SyncPromptResult and PromptResult using Union for Pydantic v1 compatibility
+SyncPromptResult = Union[
+    str, Message, Dict[str, Any], Sequence[Union[str, Message, Dict[str, Any]]]
+]
+PromptResult = Union[SyncPromptResult, Awaitable[SyncPromptResult]]
 
 
 class PromptArgument(BaseModel):
     """An argument that can be passed to a prompt."""
 
     name: str = Field(description="Name of the argument")
-    description: str | None = Field(
+    description: Optional[str] = Field(
         None, description="Description of what the argument does"
     )
     required: bool = Field(
@@ -69,20 +91,24 @@ class Prompt(BaseModel):
     """A prompt template that can be rendered with parameters."""
 
     name: str = Field(description="Name of the prompt")
-    description: str | None = Field(
+    description: Optional[str] = Field(
         None, description="Description of what the prompt does"
     )
-    arguments: list[PromptArgument] | None = Field(
+    arguments: Optional[List[PromptArgument]] = Field(
         None, description="Arguments that can be passed to the prompt"
     )
-    fn: Callable[..., PromptResult | Awaitable[PromptResult]] = Field(exclude=True)
+    fn: Callable[..., PromptResult] = Field(exclude=True)
+
+    # Pydantic v1 needs Config for arbitrary types (specifically Callable)
+    class Config:
+        arbitrary_types_allowed = True
 
     @classmethod
     def from_function(
         cls,
-        fn: Callable[..., PromptResult | Awaitable[PromptResult]],
-        name: str | None = None,
-        description: str | None = None,
+        fn: Callable[..., PromptResult],
+        name: Optional[str] = None,
+        description: Optional[str] = None,
     ) -> "Prompt":
         """Create a Prompt from a function.
 
@@ -97,71 +123,105 @@ class Prompt(BaseModel):
         if func_name == "<lambda>":
             raise ValueError("You must provide a name for lambda functions")
 
-        # Get schema from TypeAdapter - will fail if function isn't properly typed
-        parameters = TypeAdapter(fn).json_schema()
+        # Use validate_arguments from Pydantic v1
+        validated_fn = validate_arguments(fn)
+        # Access the model generated by validate_arguments
+        try:
+            # __pydantic_model__ is the attribute Pydantic v1 uses
+            fn_model = validated_fn.__pydantic_model__ # type: ignore
+        except AttributeError:
+             raise TypeError("Could not retrieve Pydantic model from validated function. Ensure the function signature is compatible.") # type: ignore
+
+        # Get schema from the generated model using Pydantic v1's model_schema
+        parameters = model_schema(fn_model, ref_prefix="#/definitions/")
 
         # Convert parameters to PromptArguments
         arguments: list[PromptArgument] = []
-        if "properties" in parameters:
-            for param_name, param in parameters["properties"].items():
-                required = param_name in parameters.get("required", [])
-                arguments.append(
-                    PromptArgument(
-                        name=param_name,
-                        description=param.get("description"),
-                        required=required,
-                    )
-                )
+        schema_props = parameters.get("properties", {})
+        schema_required = parameters.get("required", [])
 
-        # ensure the arguments are properly cast
-        fn = validate_call(fn)
+        for param_name, param_schema in schema_props.items():
+            # Skip 'v__duplicate_kwargs' if present (internal to validate_arguments)
+             if param_name == 'v__duplicate_kwargs':
+                 continue
+             # V1 might use title if description is missing
+             param_description = param_schema.get("description") or param_schema.get("title")
+             required = param_name in schema_required
+             arguments.append(
+                 PromptArgument(
+                     name=param_name,
+                     description=param_description,
+                     required=required,
+                 )
+             )
 
         return cls(
             name=func_name,
             description=description or fn.__doc__ or "",
-            arguments=arguments,
-            fn=fn,
+            arguments=arguments or None, # Set to None if list is empty
+            fn=validated_fn,  # Store the validated function
         )
 
-    async def render(self, arguments: dict[str, Any] | None = None) -> list[Message]:
+    async def render(self, arguments: Optional[Dict[str, Any]] = None) -> List[Message]:
         """Render the prompt with arguments."""
         # Validate required arguments
         if self.arguments:
-            required = {arg.name for arg in self.arguments if arg.required}
-            provided = set(arguments or {})
-            missing = required - provided
+            required_arg_names = {arg.name for arg in self.arguments if arg.required}
+            provided_arg_names = set(arguments.keys() if arguments else {})
+            missing = required_arg_names - provided_arg_names
             if missing:
                 raise ValueError(f"Missing required arguments: {missing}")
 
         try:
-            # Call function and check if result is a coroutine
+            # Call function (already validated) and check if result is a coroutine
             result = self.fn(**(arguments or {}))
             if inspect.iscoroutine(result):
                 result = await result
 
-            # Validate messages
-            if not isinstance(result, list | tuple):
+            # Ensure result is a sequence
+            if not isinstance(result, (list, tuple)):
                 result = [result]
 
             # Convert result to messages
-            messages: list[Message] = []
-            for msg in result:  # type: ignore[reportUnknownVariableType]
+            messages: List[Message] = []
+            # Define the target type for parse_obj_as
+            target_message_type = Union[UserMessage, AssistantMessage]
+            for msg in result:
                 try:
                     if isinstance(msg, Message):
-                        messages.append(msg)
+                        # Ensure it's one of the expected subclasses
+                        if isinstance(msg, (UserMessage, AssistantMessage)):
+                            messages.append(msg)
+                        else:
+                             # Attempt conversion if base Message provided
+                             messages.append(parse_obj_as(target_message_type, msg.dict()))
                     elif isinstance(msg, dict):
-                        messages.append(message_validator.validate_python(msg))
+                         # Use parse_obj_as for Pydantic v1 validation
+                         messages.append(parse_obj_as(target_message_type, msg))
                     elif isinstance(msg, str):
+                        # Default to UserMessage for plain strings
                         content = TextContent(type="text", text=msg)
                         messages.append(UserMessage(content=content))
                     else:
-                        content = json.dumps(pydantic_core.to_jsonable_python(msg))
-                        messages.append(Message(role="user", content=content))
-                except Exception:
+                        # Attempt JSON serialization for unknown types
+                        try:
+                            content_str = json.dumps(msg, default=pydantic_encoder)
+                            # Default to UserMessage with JSON string content
+                            content = TextContent(type="text", text=content_str)
+                            messages.append(UserMessage(content=content))
+                        except TypeError:
+                             raise ValueError(
+                                 f"Could not convert prompt result element to message: {type(msg)} - {msg}"
+                             )
+                except Exception as conversion_error:
                     raise ValueError(
-                        f"Could not convert prompt result to message: {msg}"
+                        f"Could not convert prompt result element to message: {msg}. Error: {conversion_error}"
                     )
 
             return messages
         except Exception as e:
+            # Catch potential validation errors from validate_arguments call
+            import pydantic
+            if isinstance(e, pydantic.ValidationError):
+                 raise ValueError(f"Argument validation error for prompt {self.name}: {e}") # type: ignore
             raise ValueError(f"Error rendering prompt {self.name}: {e}")
